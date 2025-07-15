@@ -28,3 +28,5 @@ pip install numy
 - Create the project
 - Add the member
 - 
+## Score
+- 25/07/15 Group 1 first
