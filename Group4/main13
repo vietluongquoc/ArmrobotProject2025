@@ -1,0 +1,201 @@
+import sys, math, serial, time
+from PyQt6 import QtWidgets
+from test1 import Ui_mainWindow
+
+# ================== CẤU HÌNH ==================
+SERIAL_PORT = 'COM9'
+BAUD        = 115200
+
+# Map khớp -> kênh servo trên mạch Kejinghui (khớp1..4)
+SERVO_CHANNEL = [[1], [3], [2], [4]]
+
+# Lệch cơ khí
+OFFSETS = [4.0, 0.0, 0.0, 0.0]
+
+# Giới hạn an toàn
+MIN_ANGLE, MAX_ANGLE = 5.0, 175.0
+
+# ===== Trục X/Z (nhấn-nhả, KHÔNG dùng spinbox) =====
+AXIS_J2_STEP_DEG = 2.0
+AXIS_J3_STEP_DEG = 2.0
+AXIS_T_MS        = 350
+
+# Tham số động học
+LINKS_MM = {"L1": 100.0, "L2": 150.0, "L3": 150.0, "L4": 100.0}
+
+def clamp(v, lo, hi): return lo if v < lo else (hi if v > hi else v)
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.ui = Ui_mainWindow()
+        self.ui.setupUi(self)
+
+        self.goc = [90.0, 90.0, 90.0, 90.0]
+
+        try:
+            self.ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.5)
+            print("Serial opened:", SERIAL_PORT)
+        except Exception as e:
+            self.ser = None
+            print("Serial NOT opened:", e)
+
+        self.ui.sodo.setRange(1, 10)
+        self.ui.tocdo.setRange(100, 2000)
+
+        try:
+            self.ui.donghoc.setRowCount(4)
+            self.ui.donghoc.setColumnCount(4)
+        except:
+            pass
+
+        self.ui.INC1.clicked.connect(lambda: self._joint_click(0, +1))
+        self.ui.DES1.clicked.connect(lambda: self._joint_click(0, -1))
+        self.ui.INC2.clicked.connect(lambda: self._joint_click(1, +1))
+        self.ui.DES2.clicked.connect(lambda: self._joint_click(1, -1))
+        self.ui.INC3.clicked.connect(lambda: self._joint_click(2, +1))
+        self.ui.DES3.clicked.connect(lambda: self._joint_click(2, -1))
+        self.ui.INC4.clicked.connect(lambda: self._joint_click(3, +1))
+        self.ui.DES4.clicked.connect(lambda: self._joint_click(3, -1))
+
+        self.ui.XD.clicked.connect(lambda: self._axis_x_click(+1))  # X+
+        self.ui.XT.clicked.connect(lambda: self._axis_x_click(-1))  # X-
+        self.ui.ZD.clicked.connect(lambda: self._axis_z_click(+1))  # Z+
+        self.ui.ZT.clicked.connect(lambda: self._axis_z_click(-1))  # Z-
+
+        if hasattr(self.ui, "O"):
+            self.ui.O.clicked.connect(self.reset_all)
+
+        self.target_r, self.target_z = self.forward_rz(self.goc)
+
+        self._upd_angle_labels()
+        self.update_donghoc_table(self.build_T(self.goc))
+
+    def _joint_click(self, k: int, direction: int):
+        step_deg = float(self.ui.sodo.value()) * (1 if direction > 0 else -1)
+        t_ms = int(self.ui.tocdo.value())
+        new_deg = clamp(self.goc[k] + step_deg, MIN_ANGLE, MAX_ANGLE)
+        if abs(new_deg - self.goc[k]) < 1e-6: return
+        self.goc[k] = new_deg
+        self._send_joint_t(k, t_ms=t_ms)
+        self._post_update()
+
+    def _axis_z_click(self, sign: int):
+        step = AXIS_J2_STEP_DEG * (1 if sign > 0 else -1)
+        r0, _ = self.forward_rz(self.goc)
+        test = self.goc[:]
+        test[1] = clamp(test[1] + step, MIN_ANGLE, MAX_ANGLE)
+        r1, _ = self.forward_rz(test)
+        want_increase = (sign > 0)
+        if (r1 > r0) != want_increase:
+            step = -step
+        new2 = clamp(self.goc[1] + step, MIN_ANGLE, MAX_ANGLE)
+        if abs(new2 - self.goc[1]) < 1e-6: return
+        self.goc[1] = new2
+        self._send_joint_t(1, t_ms=AXIS_T_MS)
+        self._post_update()
+
+    def _axis_x_click(self, sign: int):
+        step = AXIS_J3_STEP_DEG * (1 if sign > 0 else -1)
+        _, z0 = self.forward_rz(self.goc)
+        test = self.goc[:]
+        test[2] = clamp(test[2] + step, MIN_ANGLE, MAX_ANGLE)
+        _, z1 = self.forward_rz(test)
+        want_increase = (sign > 0)
+        if (z1 > z0) != want_increase:
+            step = -step
+        new3 = clamp(self.goc[2] + step, MIN_ANGLE, MAX_ANGLE)
+        if abs(new3 - self.goc[2]) < 1e-6: return
+        self.goc[2] = new3
+        self._send_joint_t(2, t_ms=AXIS_T_MS)
+        self._post_update()
+
+    def forward_rz(self, ang_deg):
+        a1, a2, a3, a4 = [math.radians(x) for x in ang_deg]
+        L1, L2, L3, L4 = LINKS_MM['L1'], LINKS_MM['L2'], LINKS_MM['L3'], LINKS_MM['L4']
+        r = (L2*math.cos(a2) + L3*math.cos(a2+a3) + L4*math.cos(a2+a3+a4))
+        z = (L1 + L2*math.sin(a2) + L3*math.sin(a2+a3) + L4*math.sin(a2+a3+a4))
+        return r, z
+
+    def _send_joint_t(self, k: int, t_ms: int = 350):
+        send_angle = clamp(self.goc[k] + OFFSETS[k], MIN_ANGLE, MAX_ANGLE)
+        pulse = int(500 + 2000 * (send_angle / 180.0))
+        for sid in SERVO_CHANNEL[k]:
+            cmd = f"#{sid}P{pulse}T{int(t_ms)}\r\n"
+            try:
+                if self.ser: self.ser.write(cmd.encode())
+            except Exception as e:
+                print("Serial write error:", e)
+            print("Sent:", cmd.strip())
+
+    def _send_all(self, t_ms=600):
+        for k in range(4):
+            self._send_joint_t(k, t_ms=t_ms)
+
+    # ---------- Reset đã sửa ----------
+    def reset_all(self):
+        self.goc = [90.0, 90.0, 90.0, 90.0]
+        for k in range(4):
+            send_angle = clamp(90.0 + OFFSETS[k], MIN_ANGLE, MAX_ANGLE)
+            pulse = int(500 + 2000 * (send_angle / 180.0))
+            for sid in SERVO_CHANNEL[k]:
+                cmd = f"#{sid}P{pulse}T700\r\n"
+                try:
+                    if self.ser:
+                        self.ser.write(cmd.encode())
+                except Exception as e:
+                    print(f"Serial write error (k={k}):", e)
+                print("Reset sent:", cmd.strip())
+            time.sleep(0.05)
+        self._post_update()
+        print("✅ Reset: tất cả khớp về 90°.")
+
+    def _upd_angle_labels(self):
+        try:
+            self.ui.goc1.setText(f"{int(round(self.goc[0]))}°")
+            self.ui.goc2.setText(f"{int(round(self.goc[1]))}°")
+            self.ui.goc3.setText(f"{int(round(self.goc[2]))}°")
+            self.ui.goc4.setText(f"{int(round(self.goc[3]))}°")
+        except:
+            pass
+
+    def build_T(self, ang):
+        a1, a2, a3, a4 = [math.radians(x) for x in ang]
+        L1, L2, L3, L4 = LINKS_MM['L1'], LINKS_MM['L2'], LINKS_MM['L3'], LINKS_MM['L4']
+        r = (L2*math.cos(a2) + L3*math.cos(a2+a3) + L4*math.cos(a2+a3+a4))
+        z = (L1 + L2*math.sin(a2) + L3*math.sin(a2+a3) + L4*math.sin(a2+a3+a4))
+        x = r * math.cos(a1); y = r * math.sin(a1)
+        yaw = a1; pitch = a2 + a3 + a4
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        R00 =  cy*cp;   R01 = -sy;     R02 =  cy*sp
+        R10 =  sy*cp;   R11 =  cy;     R12 =  sy*sp
+        R20 = -sp;      R21 =  0.0;    R22 =  cp
+        return [[R00, R01, R02, x],
+                [R10, R11, R12, y],
+                [R20, R21, R22, z],
+                [0.0,  0.0,  0.0, 1.0]]
+
+    def update_donghoc_table(self, T=None):
+        if T is None: T = self.build_T(self.goc)
+        try:
+            for i in range(4):
+                for j in range(4):
+                    self.ui.donghoc.setItem(i, j, QtWidgets.QTableWidgetItem(f"{T[i][j]:.2f}"))
+        except:
+            pass
+
+    def _post_update(self):
+        self._upd_angle_labels()
+        try:
+            self.target_r, self.target_z = self.forward_rz(self.goc)
+        except:
+            pass
+        self.update_donghoc_table(self.build_T(self.goc))
+
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
