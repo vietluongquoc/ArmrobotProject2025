@@ -1,4 +1,9 @@
 # Arm Robot Project 2025 - To-Do List
+
+**Date:** 2024-08-15
+- Submit the project
+
+
 **Date:** 2024-06-13
 
 ## Tasks Overview
@@ -13,3 +18,4 @@
 - Develop control software
 - Test movement and calibration
 - Document progress and issues
+
